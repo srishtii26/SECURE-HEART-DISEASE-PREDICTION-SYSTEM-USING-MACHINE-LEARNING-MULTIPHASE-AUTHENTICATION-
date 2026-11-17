@@ -1,0 +1,50 @@
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Sensitive biometric data
+admin_verification/admins/
+
+# Local datasets
+data/
+dataset/
+datasets/
+
+# Temporary files
+*.tmp
+.DS_Store
+# Entire local database folder
+database/
+
+# ECG model backups
+models/ecg/*backup*
+# Unused ECG models and backups
+models/ecg/ecg_model.keras
+models/ecg/ecg_model_v1_backup.keras
+models/ecg/class_names_v2.json
+# Old application backups
+app_backup*.py
+login_backup*.py
+
+# Python cache
+**/__pycache__/
+*.pyc
