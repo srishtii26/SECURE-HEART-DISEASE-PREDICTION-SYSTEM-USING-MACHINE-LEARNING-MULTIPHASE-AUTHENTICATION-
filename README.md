@@ -1621,7 +1621,8 @@ Overall, the project demonstrates that a healthcare machine-learning application
 
 The system provides an academic foundation for exploring secure machine learning, healthcare prediction, authentication, model integrity, and protection against machine-learning-related threats.
 
-#18. Contact
+Contact
+
 Developer: Srishti S Rao
 
 Degree: B.Tech – Electronics and Computer Science Engineering (AI/ML Specialization)
@@ -1631,6 +1632,9 @@ Institution: Christ University (Deemed to be University)
 Location: Bengaluru, India
 
 Email: srishtisrao26@gmail.com
+
 LinkedIn: https://www.linkedin.com/in/srishti-s-rao-b09189316
+
 GitHub: https://github.com/srishtii26
+
 ⭐ If you find this project interesting, consider giving the repository a star!
