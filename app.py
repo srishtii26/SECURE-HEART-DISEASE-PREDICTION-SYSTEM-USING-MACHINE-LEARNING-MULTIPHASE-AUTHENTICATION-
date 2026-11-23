@@ -1,8 +1,12 @@
-﻿import streamlit as st
+import streamlit as st
 import pandas as pd
 import time
 import sqlite3
-from datetime import datetime 
+import os
+import re
+import logging
+from datetime import datetime
+from whatsapp_otp_security import send_whatsapp_otp as send_registration_otp, verify_whatsapp_otp as verify_registration_otp
 from ecg.ecg_ui import show_ecg_analysis
 from otp_security import create_otp, verify_otp
 from whatsapp_auth import (
@@ -31,6 +35,10 @@ from matrix_security import (
     generate_matrix,
     generate_challenge,
     verify_matrix,
+    get_matrix_file,
+    load_matrix_data,
+    is_matrix_acknowledged,
+    mark_matrix_acknowledged,
 )
 from face_auth_streamlit import train_recognizer, verify_camera_image
 # ============================================================
@@ -661,13 +669,65 @@ DEFAULTS = {
     "show_register": False,
     "face_pending": False,
     "face_attempts": 0,
+    "login_password_attempts": 0,
+    "login_otp_attempts": 0,
+    "registration_otp_attempts": 0,
+    "auth_last_activity": None,
+    "auth_started_at": None,
+    "registration_stage": "details",
+    "registration_pending": None,
+    "matrix_onboarding_user": None,
+    "matrix_onboarding_source": None,
 }
 
 for key, value in DEFAULTS.items():
     if key not in st.session_state:
         st.session_state[key] = value
         # Session timeout: 15 minutes
-SESSION_TIMEOUT = 2*60
+SESSION_TIMEOUT = 15 * 60
+
+
+MAX_AUTH_ATTEMPTS = 3
+
+def reset_authentication_state(clear_registration=True):
+    """Cancel all unfinished authentication steps without changing account matrices."""
+    for key in ("otp_pending", "matrix_pending", "face_pending"):
+        st.session_state[key] = False
+    for key in ("otp_record", "otp_username", "otp_role", "otp_phone", "otp_id",
+                "generated_otp", "otp_whatsapp", "matrix_value", "matrix_positions",
+                "matrix_onboarding_user", "matrix_onboarding_source",
+                "auth_last_activity", "auth_started_at"):
+        st.session_state[key] = None
+    for key in ("matrix_attempts", "face_attempts", "login_password_attempts",
+                "login_otp_attempts", "registration_otp_attempts"):
+        st.session_state[key] = 0
+    if clear_registration:
+        st.session_state.registration_pending = None
+        st.session_state.registration_stage = "details"
+        st.session_state.show_register = False
+    for key in ("otp_input", "matrix_answer", "registration_otp_input", "login_password",
+                "register_password", "register_confirm_password"):
+        st.session_state.pop(key, None)
+
+def auth_activity():
+    """Record an explicit form submission; ordinary reruns do not refresh the deadline."""
+    st.session_state.auth_last_activity = time.monotonic()
+
+def check_auth_timeout():
+    """15-minute idle timeout for registration, password, OTP, matrix, and face steps."""
+    now = time.monotonic()
+    last = st.session_state.get("auth_last_activity")
+    if last is None:
+        st.session_state.auth_last_activity = now
+        st.session_state.auth_started_at = now
+        return True
+    if now - last >= SESSION_TIMEOUT:
+        reset_authentication_state()
+        st.session_state.auth_timeout_notice = "Authentication expired after 15 minutes of inactivity. Please start again."
+        st.rerun()
+        return False
+    return True
+
 
 
 # ============================================================
@@ -709,12 +769,15 @@ def logout(auto=False):
             pass
 
     reset_prediction()
+    reset_authentication_state()
 
     st.session_state.logged_in = False
     st.session_state.username = None
     st.session_state.role = None
     st.session_state.face_pending = False
     st.session_state.face_attempts = 0
+    st.session_state.matrix_onboarding_user = None
+    st.session_state.matrix_onboarding_source = None
     st.session_state.last_activity = None
     st.session_state.session_created = None
     st.session_state.page = "Prediction"
@@ -806,6 +869,7 @@ def show_otp_verification():
             type="primary",
             use_container_width=True,
         ):
+            auth_activity()
             if not otp_input:
                 st.warning("Please enter the OTP.")
                 return
@@ -820,10 +884,26 @@ def show_otp_verification():
             )
 
             if success:
+                st.session_state.login_otp_attempts = 0
                 # OTP verified successfully
                 st.session_state.otp_pending = False
                 st.session_state.otp_phone = None
                 st.session_state.otp_id = None
+
+                # First-time onboarding for existing users who never received their matrix.
+                # Password and phone OTP have both already been verified.
+                existing_username = st.session_state.get("otp_username")
+                if st.session_state.get("otp_role") != "admin" and existing_username:
+                    try:
+                        existing_data = load_matrix_data(existing_username)
+                        if existing_data is not None and not is_matrix_acknowledged(existing_username):
+                            st.session_state.matrix_onboarding_user = existing_username
+                            st.session_state.matrix_onboarding_source = "login"
+                            st.rerun()
+                    except Exception:
+                        logging.exception("Unable to check existing matrix acknowledgement")
+                        st.error("Unable to load your matrix. Contact the administrator.")
+                        return
 
                 # Prepare Matrix Verification
                 st.session_state.matrix_pending = True
@@ -836,7 +916,13 @@ def show_otp_verification():
                 st.rerun()
 
             else:
+                st.session_state.login_otp_attempts += 1
+                if st.session_state.login_otp_attempts >= MAX_AUTH_ATTEMPTS:
+                    reset_authentication_state()
+                    st.session_state.auth_timeout_notice = "Three incorrect OTP attempts. Please log in again."
+                    st.rerun()
                 st.error(message)
+                st.warning(f"Attempts remaining: {MAX_AUTH_ATTEMPTS - st.session_state.login_otp_attempts}")
 
     # ---------------- RESEND OTP ----------------
     with col2:
@@ -844,6 +930,7 @@ def show_otp_verification():
             "🔄 Resend OTP",
             use_container_width=True,
         ):
+            auth_activity()
             from whatsapp_otp_security import send_whatsapp_otp
 
             phone_number = st.session_state.otp_phone
@@ -868,28 +955,9 @@ def show_otp_verification():
         "Cancel Login",
         use_container_width=True,
     ):
-        st.session_state.otp_pending = False
-        st.session_state.otp_phone = None
-        st.session_state.otp_id = None
-        st.session_state.otp_username = None
-        st.session_state.otp_role = None
+        reset_authentication_state()
         st.rerun()
 
-
-def show_matrix_verification():
-    st.markdown("### 🔐 Matrix Verification")
-
-    username = st.session_state.get("otp_username")
-
-    if not username:
-        st.error(
-            "Matrix verification session expired. "
-            "Please log in again."
-        )
-        return
-    @st.cache_resource
-    def load_admin_face_model():
-        return train_recognizer()
 
 @st.cache_resource
 def load_admin_face_model():
@@ -911,7 +979,12 @@ def show_matrix_verification():
 
     # Load the user's permanent 3x4 matrix
     if st.session_state.get("matrix_value") is None:
-        st.session_state.matrix_value = generate_matrix(username)
+        from matrix_security import load_matrix_data
+        saved_matrix = load_matrix_data(username)
+        if saved_matrix is None:
+            st.error("No permanent matrix is provisioned for this account. Contact the administrator.")
+            return
+        st.session_state.matrix_value = saved_matrix["matrix"]
 
     matrix = st.session_state.matrix_value
 
@@ -961,6 +1034,7 @@ def show_matrix_verification():
         type="primary",
         use_container_width=True,
     ):
+        auth_activity()
 
         answer = answer.strip()
 
@@ -989,6 +1063,7 @@ def show_matrix_verification():
             else:
 
                 st.session_state.logged_in = True
+                st.session_state.auth_last_activity = None
                 st.session_state.last_activity = time.time()
                 st.session_state.session_created = time.time()
 
@@ -1013,13 +1088,8 @@ def show_matrix_verification():
                     "Please log in again."
                 )
 
-                st.session_state.matrix_pending = False
-                st.session_state.matrix_value = None
-                st.session_state.matrix_positions = None
-                st.session_state.matrix_attempts = 0
-                st.session_state.otp_username = None
-                st.session_state.otp_role = None
-
+                reset_authentication_state()
+                st.session_state.auth_timeout_notice = "Three incorrect matrix attempts. Please log in again."
                 st.rerun()
 
             else:
@@ -1061,6 +1131,7 @@ def show_face_verification():
     if captured_image is not None:
 
         if st.button("Verify Face", use_container_width=True):
+            auth_activity()
 
             matched_name, distance, preview = verify_camera_image(
                 captured_image.getvalue(),
@@ -1077,6 +1148,7 @@ def show_face_verification():
                 st.session_state.face_attempts = 0
 
                 st.session_state.logged_in = True
+                st.session_state.auth_last_activity = None
                 st.session_state.username = st.session_state.otp_username
                 st.session_state.role = "admin"
 
@@ -1097,208 +1169,206 @@ def show_face_verification():
 
                 st.error("Face not recognized. Please try again.")
 
-                st.write(
-                    f"Failed attempts: "
-                    f"{st.session_state.face_attempts}"
-                )
+                if st.session_state.face_attempts >= MAX_AUTH_ATTEMPTS:
+                    reset_authentication_state()
+                    st.session_state.auth_timeout_notice = "Three failed face verification attempts. Please log in again."
+                    st.rerun()
+                st.warning(f"Attempts remaining: {MAX_AUTH_ATTEMPTS - st.session_state.face_attempts}")
 
 # ============================================================
-# REGISTER PAGE
+# ONE-TIME PERMANENT MATRIX ONBOARDING
 # ============================================================
+
+def _clear_registration():
+    st.session_state.registration_stage = "details"
+    st.session_state.registration_pending = None
+    for key in ("register_username", "register_password", "register_confirm_password",
+                "register_whatsapp", "registration_otp_input"):
+        st.session_state.pop(key, None)
+
+
+def _finish_matrix_onboarding():
+    source = st.session_state.get("matrix_onboarding_source")
+    st.session_state.matrix_onboarding_user = None
+    st.session_state.matrix_onboarding_source = None
+    st.session_state.matrix_value = None
+    if source == "registration":
+        _clear_registration()
+        st.session_state.show_register = False
+        st.session_state.registration_notice = "Account created. Your matrix acknowledgement was saved. Please log in."
+        st.session_state.registration_delivery_ok = True
+    else:
+        # Continue the already verified login, without bypassing its matrix challenge.
+        st.session_state.matrix_pending = True
+        st.session_state.matrix_positions = generate_challenge()
+        st.session_state.matrix_attempts = 0
+        st.session_state.matrix_answer = ""
+    st.rerun()
+
+
+def show_matrix_onboarding():
+    """Show a permanent matrix only in an OTP-verified onboarding session."""
+    username = st.session_state.get("matrix_onboarding_user")
+    if not username:
+        st.error("Matrix onboarding session expired. Please log in again.")
+        return
+    try:
+        data = load_matrix_data(username)
+        if data is None:
+            st.error("Your matrix is missing. Contact the administrator.")
+            return
+        if is_matrix_acknowledged(username):
+            st.info("This matrix was already acknowledged and cannot be displayed again.")
+            if st.button("Continue", key="onboard_already_done"):
+                _finish_matrix_onboarding()
+            return
+        matrix = data["matrix"]
+    except Exception:
+        logging.exception("Unable to load matrix for onboarding")
+        st.error("Unable to load your permanent matrix. Contact the administrator.")
+        return
+
+    st.markdown("## 🔐 Your Permanent Security Matrix")
+    st.success("Phone verification completed. This is your existing permanent matrix.")
+    st.warning("Save this matrix securely now. It will not be displayed again after you confirm.")
+    st.caption("Columns: 1, 2, 3, 4  |  Rows: 1, 2, 3")
+    for row_number, row in enumerate(matrix, 1):
+        cols = st.columns(4)
+        for col_number, value in enumerate(row, 1):
+            cols[col_number - 1].metric(f"R{row_number}C{col_number}", value)
+    st.info("Your physical security card will use these exact same characters and positions.")
+    confirmed = st.checkbox(
+        "I have securely saved my permanent matrix and understand it will not be shown again.",
+        key="matrix_onboarding_confirm",
+    )
+    if st.button("Confirm and Continue", type="primary", disabled=not confirmed,
+                 key="matrix_onboarding_finish"):
+        auth_activity()
+        try:
+            mark_matrix_acknowledged(username)
+        except Exception:
+            logging.exception("Unable to acknowledge matrix")
+            st.error("Could not save acknowledgement. Please try again.")
+            return
+        _finish_matrix_onboarding()
+
 
 def register_page():
-
-    # --------------------------------------------------------
-    # REGISTER HEADER
-    # --------------------------------------------------------
-
-    st.markdown(
-        """<div style="max-width:540px;margin:35px auto 20px;text-align:center;">
+    st.markdown("""<div style="max-width:540px;margin:35px auto 20px;text-align:center;">
 <div style="width:58px;height:58px;margin:0 auto 15px;border-radius:17px;display:flex;align-items:center;justify-content:center;font-size:28px;background:linear-gradient(135deg,#ff4d5a,#ff765b);box-shadow:0 18px 45px rgba(255,77,90,.24);">♥</div>
 <div style="font-size:32px;font-weight:850;color:#f7f8fb;">Create your account</div>
-<div style="color:#8f96a5;font-size:13px;margin-top:7px;">Create a secure account for Secure Heart.</div>
-</div>""",
-        unsafe_allow_html=True,
-    )
-
+<div style="color:#8f96a5;font-size:13px;margin-top:7px;">Verify your phone to receive your permanent security matrix.</div>
+</div>""", unsafe_allow_html=True)
     left, center, right = st.columns([1, 1.25, 1])
-
     with center:
-
-        # ----------------------------------------------------
-        # ACCOUNT INFORMATION
-        # ----------------------------------------------------
-
-        st.markdown(
-            """<div style="margin-bottom:18px;">
-<div style="color:#e9ebf1;font-size:14px;font-weight:800;margin-bottom:5px;">Account Information</div>
-<div style="color:#7f8796;font-size:11px;line-height:1.5;">Create your Secure Heart user account.</div>
-</div>""",
-            unsafe_allow_html=True,
-        )
-
-        username = st.text_input(
-            "Username",
-            placeholder="Choose a unique username",
-            key="register_username",
-        )
-
-        password = st.text_input(
-            "Password",
-            type="password",
-            placeholder="Create a password",
-            key="register_password",
-        )
-
-        confirm_password = st.text_input(
-            "Confirm Password",
-            type="password",
-            placeholder="Re-enter your password",
-            key="register_confirm_password",
-        )
-
-        # ----------------------------------------------------
-        # WHATSAPP
-        # ----------------------------------------------------
-
-        st.markdown(
-            """<div style="margin-top:20px;margin-bottom:15px;">
-<div style="color:#e9ebf1;font-size:14px;font-weight:800;margin-bottom:5px;">Recovery & Verification</div>
-<div style="color:#7f8796;font-size:11px;line-height:1.5;">Your WhatsApp number is used for two-factor authentication.</div>
-</div>""",
-            unsafe_allow_html=True,
-        )
-
-        whatsapp = st.text_input(
-            "WhatsApp Number",
-            placeholder="+91XXXXXXXXXX",
-            key="register_whatsapp",
-        )
-
-        st.markdown(
-            """<div style="text-align:center;color:#727989;font-size:10px;margin:15px 0;line-height:1.7;">
-🔐 Password protected &nbsp; • &nbsp;
-📱 WhatsApp verification &nbsp; • &nbsp;
-🔑 Permanent matrix authentication
-</div>""",
-            unsafe_allow_html=True,
-        )
-
-        # ----------------------------------------------------
-        # CREATE ACCOUNT
-        # ----------------------------------------------------
-
-        if st.button(
-            "Create Account  →",
-            type="primary",
-            use_container_width=True,
-            key="create_account_button",
-        ):
-
-            username = username.strip()
-            whatsapp = whatsapp.strip()
-
-            # Validation
-            if not username:
-
-                st.error(
-                    "Username is required."
-                )
-
-            elif len(username) < 4:
-
-                st.error(
-                    "Username must contain at least 4 characters."
-                )
-
-            elif not password:
-
-                st.error(
-                    "Password is required."
-                )
-
-            elif len(password) < 6:
-
-                st.error(
-                    "Password must contain at least 6 characters."
-                )
-
-            elif password != confirm_password:
-
-                st.error(
-                    "Passwords do not match."
-                )
-
-            elif not whatsapp:
-
-                st.error(
-                    "WhatsApp number is required."
-                )
-
-            else:
-
-                # Create user using existing login.py
-                success, message = register_user(
-                    username,
-                    password,
-                    "user",
-                    whatsapp,
-                )
-
-                if success:
-
-                    # Create permanent security matrix
-                    generate_matrix(username)
-
-                    st.success(
-                        "Account created successfully!"
-                    )
-
-                    st.info(
-                        "Your permanent security matrix has "
-                        "also been created. Please contact the "
-                        "administrator to receive your physical card."
-                    )
-
-                    st.session_state.show_register = False
-
-                    # Clear registration fields
-                    for key in [
-                        "register_username",
-                        "register_password",
-                        "register_confirm_password",
-                        "register_whatsapp",
-                    ]:
-                        st.session_state.pop(key, None)
-
-                    st.rerun()
-
+        stage = st.session_state.get("registration_stage", "details")
+        if stage == "otp":
+            pending = st.session_state.get("registration_pending")
+            if not pending:
+                _clear_registration()
+                st.error("Registration session expired. Please start again.")
+                return
+            st.subheader("Step 2 — Verify your phone")
+            st.info("Enter the 6-digit code sent via WhatsApp or SMS fallback.")
+            otp = st.text_input("Verification code", max_chars=6,
+                                key="registration_otp_input")
+            if st.button("Verify OTP and Create Account", type="primary",
+                         use_container_width=True, key="registration_verify_button"):
+                auth_activity()
+                if not re.fullmatch(r"[0-9]{6}", otp.strip()):
+                    st.error("Enter a valid 6-digit OTP.")
                 else:
+                    try:
+                        verified, message, response = verify_registration_otp(
+                            pending["phone"], otp.strip()
+                        )
+                    except Exception:
+                        logging.exception("Registration OTP verification failed")
+                        verified, message = False, "OTP verification is temporarily unavailable."
+                    if not verified:
+                        st.session_state.registration_otp_attempts += 1
+                        if st.session_state.registration_otp_attempts >= MAX_AUTH_ATTEMPTS:
+                            reset_authentication_state()
+                            st.session_state.auth_timeout_notice = "Three incorrect registration OTP attempts. Please register again."
+                            st.rerun()
+                        st.error(message)
+                        st.warning(f"Attempts remaining: {MAX_AUTH_ATTEMPTS - st.session_state.registration_otp_attempts}")
+                    else:
+                        st.session_state.registration_otp_attempts = 0
+                        # Only provision after successful phone verification.
+                        try:
+                            success, result = register_user(
+                                pending["username"], pending["password"],
+                                "user", pending["phone"]
+                            )
+                        except Exception:
+                            logging.exception("Registration failed")
+                            success, result = False, "Could not create account. Please try again."
+                        if not success:
+                            st.error(result)
+                            _clear_registration()
+                        else:
+                            username = pending["username"]
+                            _clear_registration()
+                            try:
+                                generate_matrix(username)  # Never changes an existing matrix.
+                                if is_matrix_acknowledged(username):
+                                    st.error("This account's matrix is already acknowledged. Contact the administrator.")
+                                    return
+                            except Exception:
+                                logging.exception("Matrix provisioning failed")
+                                st.error("Account created but matrix provisioning failed. Contact the administrator.")
+                                return
+                            st.session_state.matrix_onboarding_user = username
+                            st.session_state.matrix_onboarding_source = "registration"
+                            st.rerun()
+            if st.button("Cancel registration", key="registration_cancel"):
+                reset_authentication_state()
+                st.rerun()
+            return
 
+        st.markdown("#### Account Information")
+        username = st.text_input("Username", placeholder="Choose a unique username",
+                                 key="register_username")
+        password = st.text_input("Password", type="password",
+                                 placeholder="Create a password", key="register_password")
+        confirm_password = st.text_input("Confirm Password", type="password",
+                                         placeholder="Re-enter your password", key="register_confirm_password")
+        st.markdown("#### Recovery & Verification")
+        phone = st.text_input("WhatsApp / SMS Number", placeholder="+91XXXXXXXXXX",
+                              key="register_whatsapp")
+        st.caption("🔐 Password protected  •  📱 Phone OTP  •  🔑 Permanent matrix")
+        if st.button("Send Verification OTP →", type="primary",
+                     use_container_width=True, key="create_account_button"):
+            auth_activity()
+            username, phone = username.strip(), phone.strip()
+            if len(username) < 4:
+                st.error("Username must contain at least 4 characters.")
+            elif len(password) < 6:
+                st.error("Password must contain at least 6 characters.")
+            elif password != confirm_password:
+                st.error("Passwords do not match.")
+            elif not re.fullmatch(r"\+[1-9]\d{7,14}", phone):
+                st.error("Enter a valid phone number including country code (e.g. +91...).")
+            else:
+                try:
+                    sent, message, otp_id = send_registration_otp(phone)
+                except Exception:
+                    logging.exception("Registration OTP sending failed")
+                    sent, message = False, "OTP service is temporarily unavailable."
+                if sent:
+                    st.session_state.registration_otp_attempts = 0
+                    st.session_state.registration_pending = {
+                        "username": username, "password": password, "phone": phone,
+                    }
+                    st.session_state.registration_stage = "otp"
+                    st.rerun()
+                else:
                     st.error(message)
-
-        # ----------------------------------------------------
-        # BACK TO LOGIN
-        # ----------------------------------------------------
-
-        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
-
-        if st.button(
-            "← Back to Login",
-            use_container_width=True,
-            key="back_to_login_button",
-        ):
-
+        if st.button("← Back to Login", use_container_width=True,
+                     key="back_to_login_button"):
+            _clear_registration()
             st.session_state.show_register = False
-
-            for key in [
-                "register_username",
-                "register_password",
-                "register_confirm_password",
-                "register_whatsapp",
-            ]:
-                st.session_state.pop(key, None)
-
             st.rerun()
 
 
@@ -1307,6 +1377,13 @@ def register_page():
 # ============================================================
 
 def login_page():
+    notice = st.session_state.pop("registration_notice", None)
+    if notice:
+        if st.session_state.pop("registration_delivery_ok", False):
+            st.success(notice)
+        else:
+            st.warning(notice)
+
 
     # --------------------------------------------------------
     # REGISTER PAGE
@@ -1381,6 +1458,7 @@ def login_page():
             use_container_width=True,
             key="login_button",
         ):
+            auth_activity()
 
             if not login_id or not password:
 
@@ -1475,6 +1553,8 @@ def login_page():
                 # ------------------------------------------------
 
                 if success:
+                    st.session_state.login_password_attempts = 0
+                    st.session_state.login_otp_attempts = 0
 
                     # --------------------------------------------
                     # STORE OTP STATE
@@ -1508,8 +1588,13 @@ def login_page():
                 # ------------------------------------------------
 
                 else:
-
+                    st.session_state.login_password_attempts += 1
+                    if st.session_state.login_password_attempts >= MAX_AUTH_ATTEMPTS:
+                        reset_authentication_state()
+                        st.session_state.auth_timeout_notice = "Three failed password attempts. Please start again."
+                        st.rerun()
                     st.error(result)
+                    st.warning(f"Attempts remaining: {MAX_AUTH_ATTEMPTS - st.session_state.login_password_attempts}")
 
         # ====================================================
         # SECURITY FOOTER
@@ -2616,7 +2701,22 @@ def show_matrix_management():
         key="matrix_management_user",
     )
 
-    matrix = generate_matrix(selected_user)
+    from matrix_security import load_matrix_data
+    saved_matrix = load_matrix_data(selected_user)
+    if saved_matrix is None:
+        st.warning("No matrix has been provisioned for this account.")
+        return
+    matrix = saved_matrix["matrix"]
+    st.caption(
+        "Matrix acknowledged in app: " + str(bool(saved_matrix.get("matrix_acknowledged", False)))
+        + " | Physical card received: "
+        + str(bool(saved_matrix.get("physical_card_received", False)))
+    )
+    if st.button("Mark physical card as received", key="mark_physical_received"):
+        from matrix_security import mark_physical_card_received
+        mark_physical_card_received(selected_user)
+        st.success("Physical card marked as received. The matrix was not changed.")
+        st.rerun()
 
     st.markdown("---")
 
@@ -2699,7 +2799,15 @@ def main_application():
 # APPLICATION CONTROL
 # ============================================================
 
-if st.session_state.matrix_pending:
+if not st.session_state.get("logged_in"):
+    if st.session_state.get("auth_timeout_notice"):
+        st.warning(st.session_state.pop("auth_timeout_notice"))
+    check_auth_timeout()
+
+if st.session_state.get("matrix_onboarding_user"):
+    show_matrix_onboarding()
+
+elif st.session_state.matrix_pending:
     show_matrix_verification()
 
 elif st.session_state.face_pending:

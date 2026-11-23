@@ -1,7 +1,8 @@
-import random
+import secrets
 import string
 import json
 import hashlib
+import os
 from pathlib import Path
 
 
@@ -21,11 +22,6 @@ MATRIX_DIRECTORY = Path("database") / "matrices"
 # ============================================================
 
 def ensure_matrix_directory():
-    """
-    Create the physical matrix storage directory
-    if it does not already exist.
-    """
-
     MATRIX_DIRECTORY.mkdir(
         parents=True,
         exist_ok=True
@@ -37,11 +33,6 @@ def ensure_matrix_directory():
 # ============================================================
 
 def get_matrix_file(username):
-    """
-    Create a safe and unique filename for each user.
-
-    The actual username is not used directly as the filename.
-    """
 
     username_hash = hashlib.sha256(
         username.encode("utf-8")
@@ -55,101 +46,214 @@ def get_matrix_file(username):
 # ============================================================
 
 def create_matrix():
-    """
-    Generate a permanent 3x4 matrix.
-
-    Each character is unique.
-    """
 
     characters = string.ascii_uppercase + string.digits
 
-    values = random.sample(
-        characters,
-        MATRIX_ROWS * MATRIX_COLUMNS
-    )
+    values = list(characters)
+
+    # Cryptographically secure randomization
+    secrets.SystemRandom().shuffle(values)
+
+    values = values[:MATRIX_ROWS * MATRIX_COLUMNS]
 
     matrix = []
 
     for row in range(MATRIX_ROWS):
+
         start = row * MATRIX_COLUMNS
         end = start + MATRIX_COLUMNS
 
-        matrix.append(
-            values[start:end]
-        )
+        matrix.append(values[start:end])
 
     return matrix
 
 
 # ============================================================
-# GET OR CREATE USER MATRIX
+# LOAD MATRIX DATA
 # ============================================================
 
-def generate_matrix(username):
-    """
-    Return the permanent matrix assigned to a user.
+def load_matrix_data(username):
 
-    If the user already has a matrix, the same matrix
-    is returned.
+    matrix_file = get_matrix_file(username)
 
-    If the user does not have one, a new matrix is
-    created and permanently stored.
-    """
+    if not matrix_file.exists():
+        return None
+
+    try:
+        with open(
+            matrix_file,
+            "r",
+            encoding="utf-8"
+        ) as file:
+            data = json.load(file)
+
+        if not isinstance(data.get("matrix"), list):
+            raise ValueError("Invalid matrix data.")
+
+        return data
+
+    except (json.JSONDecodeError, OSError, ValueError) as error:
+        raise RuntimeError(
+            "Existing matrix could not be loaded. "
+            "Matrix regeneration has been blocked."
+        ) from error
+
+
+# ============================================================
+# SAVE MATRIX DATA
+# ============================================================
+
+def save_matrix_data(username, data):
 
     ensure_matrix_directory()
 
     matrix_file = get_matrix_file(username)
 
-    # --------------------------------------------------------
-    # Existing matrix
-    # --------------------------------------------------------
+    temporary_file = matrix_file.with_suffix(".tmp")
 
-    if matrix_file.exists():
+    with open(
+        temporary_file,
+        "w",
+        encoding="utf-8"
+    ) as file:
+        json.dump(data, file, indent=4)
 
-        try:
-            with open(
-                matrix_file,
-                "r",
-                encoding="utf-8"
-            ) as file:
+    os.replace(temporary_file, matrix_file)
 
-                data = json.load(file)
 
-            return data["matrix"]
+# ============================================================
+# GET OR CREATE PERMANENT MATRIX
+# ============================================================
 
-        except (
-            json.JSONDecodeError,
-            KeyError,
-            OSError
-        ):
-            pass
+def generate_matrix(username):
 
-    # --------------------------------------------------------
-    # Create new matrix
-    # --------------------------------------------------------
+    ensure_matrix_directory()
 
+    existing_data = load_matrix_data(username)
+
+    # Return existing permanent matrix
+    if existing_data is not None:
+        return existing_data["matrix"]
+
+    # Generate matrix only if none exists
     matrix = create_matrix()
 
     data = {
         "username": username,
         "rows": MATRIX_ROWS,
         "columns": MATRIX_COLUMNS,
-        "matrix": matrix
+        "matrix": matrix,
+        "digital_matrix_sent": False,
+        "physical_card_received": False
     }
 
-    with open(
-        matrix_file,
-        "w",
-        encoding="utf-8"
-    ) as file:
+    matrix_file = get_matrix_file(username)
 
-        json.dump(
-            data,
-            file,
-            indent=4
-        )
+    # Exclusive creation prevents overwriting an existing matrix
+    try:
+        with open(
+            matrix_file,
+            "x",
+            encoding="utf-8"
+        ) as file:
+            json.dump(data, file, indent=4)
+
+    except FileExistsError:
+        # Another process created the matrix first
+        existing_data = load_matrix_data(username)
+        return existing_data["matrix"]
 
     return matrix
+
+
+# ============================================================
+# CHECK DIGITAL MATRIX DELIVERY
+# ============================================================
+
+def is_digital_matrix_sent(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        return False
+
+    return data.get("digital_matrix_sent", False)
+
+
+# ============================================================
+# MARK DIGITAL MATRIX AS SENT
+# ============================================================
+
+def mark_digital_matrix_sent(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        raise ValueError("Matrix does not exist.")
+
+    data["digital_matrix_sent"] = True
+
+    save_matrix_data(username, data)
+
+
+# ============================================================
+# CHECK PHYSICAL CARD STATUS
+# ============================================================
+
+def is_physical_card_received(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        return False
+
+    return data.get("physical_card_received", False)
+
+
+# ============================================================
+# MARK PHYSICAL CARD AS RECEIVED
+# ============================================================
+
+def mark_physical_card_received(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        raise ValueError("Matrix does not exist.")
+
+    data["physical_card_received"] = True
+
+    save_matrix_data(username, data)
+
+
+# ============================================================
+# FORMAT MATRIX FOR DIGITAL DELIVERY
+# ============================================================
+
+def format_matrix_message(username, matrix):
+
+    message = f"""
+SECURE HEART DISEASE PREDICTION SYSTEM
+
+Hello {username},
+
+Your permanent authentication matrix:
+
+        1   2   3   4
+    A   {matrix[0][0]}   {matrix[0][1]}   {matrix[0][2]}   {matrix[0][3]}
+    B   {matrix[1][0]}   {matrix[1][1]}   {matrix[1][2]}   {matrix[1][3]}
+    C   {matrix[2][0]}   {matrix[2][1]}   {matrix[2][2]}   {matrix[2][3]}
+
+IMPORTANT:
+
+1. This is your permanent matrix.
+2. Your physical card will contain the SAME matrix.
+3. Keep this matrix confidential.
+4. It will not be sent automatically again.
+5. Use this matrix during authentication.
+"""
+
+    return message.strip()
 
 
 # ============================================================
@@ -157,13 +261,6 @@ def generate_matrix(username):
 # ============================================================
 
 def generate_challenge():
-    """
-    Generate a new random challenge.
-
-    The matrix itself remains permanent.
-
-    Only the requested positions change.
-    """
 
     positions = [
         (row, col)
@@ -171,7 +268,7 @@ def generate_challenge():
         for col in range(MATRIX_COLUMNS)
     ]
 
-    return random.sample(
+    return secrets.SystemRandom().sample(
         positions,
         CHALLENGE_LENGTH
     )
@@ -182,10 +279,6 @@ def generate_challenge():
 # ============================================================
 
 def get_challenge_answer(matrix, positions):
-    """
-    Get the characters from the requested positions
-    in the exact challenge order.
-    """
 
     return "".join(
         matrix[row][col]
@@ -197,21 +290,45 @@ def get_challenge_answer(matrix, positions):
 # VERIFY MATRIX
 # ============================================================
 
-def verify_matrix(
-    matrix,
-    positions,
-    entered_answer
-):
-    """
-    Verify the characters entered by the user.
-    """
+def verify_matrix(matrix, positions, entered_answer):
 
     correct_answer = get_challenge_answer(
         matrix,
         positions
     )
 
-    return (
-        entered_answer.strip().upper()
-        == correct_answer.upper()
+    return secrets.compare_digest(
+        entered_answer.strip().upper(),
+        correct_answer.upper()
     )
+    # ============================================================
+# CHECK MATRIX ACKNOWLEDGEMENT
+# ============================================================
+
+def is_matrix_acknowledged(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        return False
+
+    return data.get("matrix_acknowledged", False)
+
+
+# ============================================================
+# MARK MATRIX AS ACKNOWLEDGED
+# ============================================================
+
+def mark_matrix_acknowledged(username):
+
+    data = load_matrix_data(username)
+
+    if data is None:
+        raise ValueError("Matrix does not exist.")
+
+    if data.get("matrix_acknowledged", False):
+        return
+
+    data["matrix_acknowledged"] = True
+
+    save_matrix_data(username, data)
