@@ -1625,7 +1625,7 @@ Contact
 
 Developer: Srishti S Rao
 
-Degree: B.Tech – Electronics and Computer Science Engineering (AI/ML Specialization)
+Degree: B.Tech – Electronics and Computer  Engineering (AI/ML Specialization)
 
 Institution: Christ University (Deemed to be University)
 
